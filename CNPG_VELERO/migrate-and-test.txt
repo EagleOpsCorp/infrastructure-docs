@@ -1,0 +1,133 @@
+#!/bin/bash
+# Script to migrate data from mock StatefulSet database to CNPG cluster and perform tests
+
+# Exit on error
+set -e
+
+# Variables
+NAMESPACE="cnpg-system"
+MOCK_DB_SERVICE="mock-postgres"
+CNPG_CLUSTER="test-cluster"
+CNPG_DB_NAME="appdb"
+CNPG_USER="postgres"
+CNPG_PASSWORD="postgrespassword"
+TEST_APP_NAME="test-app"
+
+# Wait for mock database to be ready
+echo "Waiting for mock database to be ready..."
+kubectl wait --namespace ${NAMESPACE} --for=condition=Ready pod -l app=mock-postgres --timeout=300s
+
+# Populate mock database with sample data
+echo "Populating mock database with sample data..."
+kubectl exec -n ${NAMESPACE} -i mock-postgres-0 -- psql -U postgres -d appdb -c "
+CREATE TABLE users (id SERIAL PRIMARY KEY, name VARCHAR(100));
+INSERT INTO users (name) VALUES ('Alice'), ('Bob'), ('Charlie');
+"
+
+# Wait for CNPG cluster to be ready
+echo "Waiting for CNPG cluster to be ready..."
+kubectl wait --namespace ${NAMESPACE} --for=condition=Ready pod -l cnpg.io/cluster=${CNPG_CLUSTER} --timeout=300s
+
+# Get CNPG cluster connection details
+CNPG_SERVICE="${CNPG_CLUSTER}-rw"
+CNPG_HOST=$(kubectl get service -n ${NAMESPACE} ${CNPG_SERVICE} -o jsonpath='{.spec.clusterIP}')
+
+# Export data from mock database
+echo "Exporting data from mock database..."
+kubectl exec -n ${NAMESPACE} mock-postgres-0 -- pg_dump -U postgres -d appdb > dump.sql
+
+# Import data into CNPG cluster
+echo "Importing data into CNPG cluster..."
+kubectl cp dump.sql ${NAMESPACE}/$(kubectl get pod -n ${NAMESPACE} -l cnpg.io/cluster=${CNPG_CLUSTER},role=primary -o name | head -n 1):/tmp/dump.sql
+kubectl exec -n ${NAMESPACE} -i $(kubectl get pod -n ${NAMESPACE} -l cnpg.io/cluster=${CNPG_CLUSTER},role=primary -o name | head -n 1) -- psql -U ${CNPG_USER} -d ${CNPG_DB_NAME} -f /tmp/dump.sql
+
+# Validate data integrity
+echo "Validating data integrity..."
+COUNT=$(kubectl exec -n ${NAMESPACE} -i $(kubectl get pod -n ${NAMESPACE} -l cnpg.io/cluster=${CNPG_CLUSTER},role=primary -o name | head -n 1) -- psql -U ${CNPG_USER} -d ${CNPG_DB_NAME} -t -c "SELECT COUNT(*) FROM users;")
+if [ "$COUNT" -eq 3 ]; then
+    echo "Data migration successful: 3 records found."
+else
+    echo "Data migration failed: Expected 3 records, found $COUNT."
+    exit 1
+fi
+
+# Deploy test application
+echo "Deploying test application..."
+cat <<EOF | kubectl apply -n ${NAMESPACE} -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${TEST_APP_NAME}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${TEST_APP_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${TEST_APP_NAME}
+    spec:
+      containers:
+      - name: test-app
+        image: node:18
+        command: ["node", "-e"]
+        args:
+        - |
+          const { Pool } = require('pg');
+          const pool = new Pool({
+            user: '${CNPG_USER}',
+            host: '${CNPG_SERVICE}',
+            database: '${CNPG_DB_NAME}',
+            password: '${CNPG_PASSWORD}',
+            port: 5432,
+          });
+          (async () => {
+            try {
+              const res = await pool.query('SELECT * FROM users');
+              console.log('Query successful:', res.rows);
+              process.exit(0);
+            } catch (err) {
+              console.error('Query failed:', err);
+              process.exit(1);
+            }
+          })();
+EOF
+
+# Wait for test application to complete
+echo "Waiting for test application to complete..."
+kubectl wait --namespace ${NAMESPACE} --for=condition=complete pod -l app=${TEST_APP_NAME} --timeout=300s
+
+# Check test application logs
+echo "Checking test application logs..."
+kubectl logs -n ${NAMESPACE} -l app=${TEST_APP_NAME}
+
+# Test failover
+echo "Testing failover..."
+PRIMARY_POD=$(kubectl get pod -n ${NAMESPACE} -l cnpg.io/cluster=${CNPG_CLUSTER},role=primary -o name | head -n 1)
+kubectl delete pod -n ${NAMESPACE} ${PRIMARY_POD}
+echo "Waiting for new primary to be promoted..."
+sleep 30
+NEW_PRIMARY_POD=$(kubectl get pod -n ${NAMESPACE} -l cnpg.io/cluster=${CNPG_CLUSTER},role=primary -o name | head -n 1)
+if [ -n "$NEW_PRIMARY_POD" ]; then
+    echo "Failover successful: New primary is $NEW_PRIMARY_POD."
+else
+    echo "Failover failed: No new primary found."
+    exit 1
+fi
+
+# Test backup
+echo "Triggering manual backup..."
+cat <<EOF | kubectl apply -n ${NAMESPACE} -f -
+apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata:
+  name: manual-backup
+spec:
+  cluster:
+    name: ${CNPG_CLUSTER}
+EOF
+echo "Waiting for backup to complete..."
+kubectl wait --namespace ${NAMESPACE} --for=condition=Complete backup/manual-backup --timeout=300s
+
+echo "All tests completed successfully."

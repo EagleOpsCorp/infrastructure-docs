@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mock-postgres
+  namespace: cnpg-system
+spec:
+  serviceName: mock-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-postgres
+  template:
+    metadata:
+      labels:
+        app: mock-postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15
+        env:
+        - name: POSTGRES_USER
+          value: postgres
+        - name: POSTGRES_PASSWORD
+          value: postgrespassword
+        - name: POSTGRES_DB
+          value: appdb
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: standard
+      resources:
+        requests:
+          storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-postgres
+  namespace: cnpg-system
+spec:
+  ports:
+  - port: 5432
+    targetPort: 5432
+  selector:
+    app: mock-postgres
